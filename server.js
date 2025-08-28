@@ -62,6 +62,7 @@ function playUrlFor(req, token) {
 }
 
 async function makeQrDataUrl(text) {
+  // NOTE: Option A is CSS-only; leaving QR bitmap size unchanged (scale: 8)
   return QRCode.toDataURL(text, {
     errorCorrectionLevel: 'M',
     scale: 8,
@@ -138,13 +139,9 @@ function fileStore() {
 
 // ---- Postgres-backed store ----
 function pgStore() {
-  const useSSL =
-    process.env.PGSSLMODE === 'require' ||
-    /render|heroku|supabase|neon/i.test(DATABASE_URL || '');
-
   const pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: useSSL ? { rejectUnauthorized: false } : undefined,
+    // If you set PGSSLMODE=require in env, most providers will negotiate SSL automatically.
     max: 5
   });
 
@@ -263,18 +260,19 @@ app.get('/kiosk', async (req, res) => {
   const playUrl = playUrlFor(req, token);
   const qrDataUrl = await makeQrDataUrl(playUrl);
 
+  // ===== Option A (CSS-only) — smaller QR + tighter layout for iPhone 6 =====
   const html = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Flashka Kiosk</title>
 <style>
  body{font-family:Arial,Helvetica,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#fafafa}
- .wrap{width:min(460px,92vw);text-align:center;padding:24px;background:#fff;border:1px solid #eee;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,0.06)}
- img.logo{width:100%;height:auto;object-fit:contain;margin-bottom:12px}
- h1{font-size:22px;margin:8px 0 6px}
- .sub{font-size:13px;color:#555;margin-bottom:16px}
- .qr{border:1px solid #e5e5e5;padding:12px;border-radius:12px}
- .token{color:#333;margin-top:6px;font-size:14px}
+ .wrap{width:min(360px,96vw);text-align:center;padding:16px;background:#fff;border:1px solid #eee;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,0.06)}
+ img.logo{max-width:320px;width:100%;height:auto;object-fit:contain;margin-bottom:10px}
+ h1{font-size:20px;margin:6px 0 6px}
+ .sub{font-size:12px;color:#555;margin-bottom:12px}
+ .qr{border:1px solid #e5e5e5;padding:10px;border-radius:12px}
+ .token{color:#333;margin-top:6px;font-size:13px}
 </style>
 </head><body>
  <div class="wrap">
@@ -282,7 +280,7 @@ app.get('/kiosk', async (req, res) => {
    <h1>Scan to play Flashka</h1>
    <div class="sub">Each scan generates a fresh, single-use game link.</div>
    <div class="qr">
-     <img id="qrImg" src="${qrDataUrl}" alt="QR" style="width:100%;height:auto"/>
+     <img id="qrImg" src="${qrDataUrl}" alt="QR" style="width:85%;max-width:260px;height:auto"/>
      <div id="tokenInfo" class="token">Token: <strong>${token}</strong></div>
    </div>
  </div>

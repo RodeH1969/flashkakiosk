@@ -1,12 +1,5 @@
 // server.js — Flashka Kiosk (Express + QR + daily stats)
-// Folder structure expected:
-// C:\Users\User\Desktop\flashka\kiosk\
-//   server.js
-//   package.json
-//   .env           (optional; see notes at bottom)
-//   \public\flashka_logo.png
-//
-// Dependencies in package.json: express, qrcode, dotenv, pg
+// Works on Render with Postgres (self-signed cert handled) or local JSON fallback.
 
 require('dotenv').config();
 const express = require('express');
@@ -19,57 +12,30 @@ const app = express();
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3030;
-
-// Public base URL for the kiosk itself. On Render, you can omit this;
-// the server will derive it from the incoming request host automatically.
-const ENV_BASE_URL = process.env.BASE_URL || null;
-
-// Where players should be sent on first scan. {token} will be replaced.
-// Defaults to your Render game URL if not provided.
-const GAME_URL_TEMPLATE =
-  process.env.GAME_URL_TEMPLATE || 'https://flashka.onrender.com/?token={token}';
-
-// Optional: protect /kiosk/stats, /kiosk/stats.json, /kiosk/stats.csv
+const ENV_BASE_URL = process.env.BASE_URL || null; // usually not needed on Render
+const GAME_URL_TEMPLATE = process.env.GAME_URL_TEMPLATE || 'https://flashka.onrender.com/?token={token}';
 const ADMIN_KEY = process.env.ADMIN_KEY || null;
-
-// Optional: Postgres URL. If set, data persists in Postgres; otherwise JSON files.
 const DATABASE_URL = process.env.DATABASE_URL || null;
 
-// ---------- STATIC ASSETS ----------
-const PUBLIC_DIR = path.join(__dirname, 'public'); // NOTE: kiosk/public
+// ---------- STATIC ----------
+const PUBLIC_DIR = path.join(__dirname, 'public'); // kiosk/public
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
 // ---------- TIME / HELPERS ----------
 const BRIS_TZ = 'Australia/Brisbane';
-
 function dayKeyBrisbane(d = new Date()) {
-  // "YYYY-MM-DD"
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: BRIS_TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).format(d);
+  return new Intl.DateTimeFormat('en-CA', { timeZone: BRIS_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
 }
-
 function buildBaseUrl(req) {
   return ENV_BASE_URL || `${req.protocol}://${req.get('host')}`;
 }
-
 function playUrlFor(req, token) {
   return `${buildBaseUrl(req)}/kiosk/play/${token}`;
 }
-
 async function makeQrDataUrl(text) {
-  // NOTE: Option A is CSS-only; leaving QR bitmap size unchanged (scale: 8)
-  return QRCode.toDataURL(text, {
-    errorCorrectionLevel: 'M',
-    scale: 8,
-    margin: 1
-  });
+  return QRCode.toDataURL(text, { errorCorrectionLevel: 'M', scale: 8, margin: 1 });
 }
-
 function requireAdmin(req, res) {
   if (!ADMIN_KEY) return null;
   if ((req.query.key || '') === ADMIN_KEY) return null;
@@ -77,55 +43,33 @@ function requireAdmin(req, res) {
   return 'blocked';
 }
 
-// ---------- STORAGE LAYER (Postgres or JSON) ----------
+// ---------- STORAGE (PG or JSON) ----------
 const DATA_DIR = path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const METRICS_FILE = path.join(DATA_DIR, 'metrics.json');
-
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-}
+function ensureDataDir() { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR); }
 function loadJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf-8'));
-  } catch {
-    return fallback;
-  }
+  try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf-8')) : fallback; } catch { return fallback; }
 }
-function saveJson(file, obj) {
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2));
-}
+function saveJson(file, obj) { fs.writeFileSync(file, JSON.stringify(obj, null, 2)); }
 
-const usingPG = !!DATABASE_URL;
-let store;
-
-// ---- File-backed store (JSON) ----
 function fileStore() {
   ensureDataDir();
   let state = loadJson(STATE_FILE, { currentToken: 1000, consumed: {} });
   let metrics = loadJson(METRICS_FILE, { tz: BRIS_TZ, days: {} });
-
-  function saveState() { saveJson(STATE_FILE, state); }
-  function saveMetrics() { saveJson(METRICS_FILE, metrics); }
+  const saveState = () => saveJson(STATE_FILE, state);
+  const saveMetrics = () => saveJson(METRICS_FILE, metrics);
 
   return {
     async init() {},
     async getCurrentToken() { return state.currentToken; },
     async setCurrentToken(v) { state.currentToken = v; saveState(); },
     async isConsumed(token) { return !!state.consumed[String(token)]; },
-    async consumeToken(token) {
-      state.consumed[String(token)] = new Date().toISOString();
-      saveState();
-    },
-    async getConsumedAt(token) {
-      return state.consumed[String(token)] || null;
-    },
+    async consumeToken(token) { state.consumed[String(token)] = new Date().toISOString(); saveState(); },
+    async getConsumedAt(token) { return state.consumed[String(token)] || null; },
     async bumpMetric(kind) {
       const day = dayKeyBrisbane();
-      if (!metrics.days[day]) {
-        metrics.days[day] = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
-      }
+      if (!metrics.days[day]) metrics.days[day] = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
       metrics.days[day][kind] = (metrics.days[day][kind] || 0) + 1;
       saveMetrics();
     },
@@ -137,11 +81,11 @@ function fileStore() {
   };
 }
 
-// ---- Postgres-backed store ----
 function pgStore() {
+  // IMPORTANT: allow Render's self-signed PG cert
   const pool = new Pool({
     connectionString: DATABASE_URL,
-    // If you set PGSSLMODE=require in env, most providers will negotiate SSL automatically.
+    ssl: { rejectUnauthorized: false },
     max: 5
   });
 
@@ -164,25 +108,19 @@ function pgStore() {
           revisits INTEGER NOT NULL DEFAULT 0
         );
       `);
-      // seed state if missing
       const r = await pool.query(`SELECT 1 FROM kiosk_state WHERE key='state'`);
       if (!r.rowCount) {
-        await pool.query(
-          `INSERT INTO kiosk_state(key, value) VALUES ('state', $1)`,
-          [{ currentToken: 1000 }]
-        );
+        await pool.query(`INSERT INTO kiosk_state(key,value) VALUES ('state', $1)`, [{ currentToken: 1000 }]);
       }
     },
     async getCurrentToken() {
-      const r = await pool.query(
-        `SELECT (value->>'currentToken')::int AS t FROM kiosk_state WHERE key='state'`
-      );
+      const r = await pool.query(`SELECT (value->>'currentToken')::int AS t FROM kiosk_state WHERE key='state'`);
       return r.rows[0]?.t ?? 1000;
     },
     async setCurrentToken(v) {
       await pool.query(
-        `INSERT INTO kiosk_state(key, value) VALUES ('state', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        `INSERT INTO kiosk_state(key,value) VALUES ('state',$1)
+         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
         [{ currentToken: v }]
       );
     },
@@ -191,16 +129,10 @@ function pgStore() {
       return r.rowCount > 0;
     },
     async consumeToken(token) {
-      await pool.query(
-        `INSERT INTO consumed_tokens(token) VALUES ($1) ON CONFLICT DO NOTHING`,
-        [token]
-      );
+      await pool.query(`INSERT INTO consumed_tokens(token) VALUES ($1) ON CONFLICT DO NOTHING`, [token]);
     },
     async getConsumedAt(token) {
-      const r = await pool.query(
-        `SELECT consumed_at FROM consumed_tokens WHERE token=$1`,
-        [token]
-      );
+      const r = await pool.query(`SELECT consumed_at FROM consumed_tokens WHERE token=$1`, [token]);
       return r.rowCount ? r.rows[0].consumed_at.toISOString() : null;
     },
     async bumpMetric(kind) {
@@ -209,50 +141,44 @@ function pgStore() {
       cols[kind] = 1;
       await pool.query(
         `INSERT INTO metrics_days(day, qr_scans, unique_scans, redirects, revisits)
-         VALUES ($1::date, $2, $3, $4, $5)
+         VALUES ($1::date,$2,$3,$4,$5)
          ON CONFLICT (day) DO UPDATE SET
-           qr_scans    = metrics_days.qr_scans    + EXCLUDED.qr_scans,
-           unique_scans= metrics_days.unique_scans+ EXCLUDED.unique_scans,
-           redirects   = metrics_days.redirects   + EXCLUDED.redirects,
-           revisits    = metrics_days.revisits    + EXCLUDED.revisits`,
+           qr_scans = metrics_days.qr_scans + EXCLUDED.qr_scans,
+           unique_scans = metrics_days.unique_scans + EXCLUDED.unique_scans,
+           redirects = metrics_days.redirects + EXCLUDED.redirects,
+           revisits = metrics_days.revisits + EXCLUDED.revisits`,
         [day, cols.qr_scans, cols.unique_scans, cols.redirects, cols.revisits]
       );
     },
     async getMetrics() {
-      const r = await pool.query(
-        `SELECT day, qr_scans, unique_scans, redirects, revisits
-         FROM metrics_days ORDER BY day`
-      );
+      const r = await pool.query(`SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`);
       const out = { tz: BRIS_TZ, days: {} };
       for (const row of r.rows) {
-        const d = row.day.toISOString().slice(0, 10);
+        const d = row.day.toISOString().slice(0,10);
         out.days[d] = {
-          qr_scans: Number(row.qr_scans) || 0,
-          unique_scans: Number(row.unique_scans) || 0,
-          redirects: Number(row.redirects) || 0,
-          revisits: Number(row.revisits) || 0
+          qr_scans: Number(row.qr_scans)||0,
+          unique_scans: Number(row.unique_scans)||0,
+          redirects: Number(row.redirects)||0,
+          revisits: Number(row.revisits)||0
         };
       }
       return out;
     },
     async getMetricsRows() {
-      const r = await pool.query(
-        `SELECT day, qr_scans, unique_scans, redirects, revisits
-         FROM metrics_days ORDER BY day`
-      );
+      const r = await pool.query(`SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`);
       return r.rows.map(row => ({
-        day: row.day.toISOString().slice(0, 10),
-        qr_scans: Number(row.qr_scans) || 0,
-        unique_scans: Number(row.unique_scans) || 0,
-        redirects: Number(row.redirects) || 0,
-        revisits: Number(row.revisits) || 0
+        day: row.day.toISOString().slice(0,10),
+        qr_scans: Number(row.qr_scans)||0,
+        unique_scans: Number(row.unique_scans)||0,
+        redirects: Number(row.redirects)||0,
+        revisits: Number(row.revisits)||0
       }));
     }
   };
 }
 
-// Pick store implementation
-store = usingPG ? pgStore() : fileStore();
+const usingPG = !!DATABASE_URL;
+let store = usingPG ? pgStore() : fileStore();
 
 // ---------- VIEWS ----------
 app.get('/kiosk', async (req, res) => {
@@ -260,7 +186,7 @@ app.get('/kiosk', async (req, res) => {
   const playUrl = playUrlFor(req, token);
   const qrDataUrl = await makeQrDataUrl(playUrl);
 
-  // ===== Option A (CSS-only) — smaller QR + tighter layout for iPhone 6 =====
+  // Smaller QR + tighter layout (iPhone 6 friendly)
   const html = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -310,60 +236,50 @@ app.get('/kiosk', async (req, res) => {
 app.get('/kiosk/api/current', async (req, res) => {
   const token = await store.getCurrentToken();
   const playUrl = playUrlFor(req, token);
-  res.json({
-    token,
-    playUrl,
-    qrDataUrl: await makeQrDataUrl(playUrl)
-  });
+  res.json({ token, playUrl, qrDataUrl: await makeQrDataUrl(playUrl) });
 });
 
-// Player landing: count stats, consume, advance, redirect to game (single-use)
+// Player landing: count → consume → advance → redirect (single-use)
 app.get('/kiosk/play/:token', async (req, res) => {
   const token = parseInt(req.params.token, 10);
   if (!Number.isInteger(token)) return res.status(400).send('Invalid token');
 
-  // Count every landing as a scan
   await store.bumpMetric('qr_scans');
 
-  const alreadyUsed = await store.isConsumed(token);
-  if (!alreadyUsed) {
+  const used = await store.isConsumed(token);
+  if (!used) {
     await store.consumeToken(token);
     await store.bumpMetric('unique_scans');
 
     const current = await store.getCurrentToken();
-    if (token === current) {
-      await store.setCurrentToken(current + 1); // advance kiosk
-    }
+    if (token === current) await store.setCurrentToken(current + 1);
 
-    // First-time: redirect to your game
     await store.bumpMetric('redirects');
     const target = GAME_URL_TEMPLATE.replace('{token}', String(token));
     return res.redirect(302, target);
   }
 
-  // Re-use → expired
   await store.bumpMetric('revisits');
   const consumedAt = (store.getConsumedAt ? await store.getConsumedAt(token) : null) || 'earlier';
-  res
-    .status(410)
-    .send(
-      `<h1>Link expired</h1><p>This game link was already used at <b>${consumedAt}</b>.</p>
-       <p>Please scan a fresh QR at the kiosk.</p>`
-    );
+  res.status(410).send(
+    `<h1>Link expired</h1><p>This game link was already used at <b>${consumedAt}</b>.</p>
+     <p>Please scan a fresh QR at the kiosk.</p>`
+  );
 });
 
 // ---------- STATS ----------
 app.get('/kiosk/stats', async (req, res) => {
   if (requireAdmin(req, res)) return;
   const rows = await store.getMetricsRows();
-  const body =
-    rows.map(r => `<tr>
-      <td>${r.day}</td>
-      <td style="text-align:right">${r.qr_scans||0}</td>
-      <td style="text-align:right">${r.unique_scans||0}</td>
-      <td style="text-align:right">${r.redirects||0}</td>
-      <td style="text-align:right">${r.revisits||0}</td>
-    </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#777">No data yet</td></tr>';
+  const body = rows.length
+    ? rows.map(r => `<tr>
+        <td>${r.day}</td>
+        <td style="text-align:right">${r.qr_scans||0}</td>
+        <td style="text-align:right">${r.unique_scans||0}</td>
+        <td style="text-align:right">${r.redirects||0}</td>
+        <td style="text-align:right">${r.revisits||0}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="5" style="text-align:center;color:#777">No data yet</td></tr>';
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!doctype html><html><head>
@@ -371,13 +287,10 @@ app.get('/kiosk/stats', async (req, res) => {
   <title>Flashka – Kiosk Stats</title>
   <style>
     body{font-family:Arial,Helvetica,sans-serif;padding:24px;background:#fafafa}
-    h1{margin:0 0 8px}
-    .sub{color:#555;margin:0 0 16px}
+    h1{margin:0 0 8px}.sub{color:#555;margin:0 0 16px}
     table{width:100%;max-width:680px;border-collapse:collapse;background:#fff;border:1px solid #eee;border-radius:12px;overflow:hidden}
-    th,td{padding:10px;border-bottom:1px solid #f0f0f0}
-    th{background:#f7f7f7;text-align:left}
-    tr:last-child td{border-bottom:none}
-    .actions a{margin-right:10px}
+    th,td{padding:10px;border-bottom:1px solid #f0f0f0} th{background:#f7f7f7;text-align:left}
+    tr:last-child td{border-bottom:none}.actions a{margin-right:10px}
   </style></head><body>
   <h1>Flashka – Kiosk Stats</h1>
   <div class="sub">Timezone: ${BRIS_TZ}</div>
@@ -400,30 +313,24 @@ app.get('/kiosk/stats', async (req, res) => {
 
 app.get('/kiosk/stats.json', async (req, res) => {
   if (requireAdmin(req, res)) return;
-  const metrics = await store.getMetrics();
-  res.json(metrics);
+  res.json(await store.getMetrics());
 });
 
 app.get('/kiosk/stats.csv', async (req, res) => {
   if (requireAdmin(req, res)) return;
   const rows = await store.getMetricsRows();
   let csv = 'date,qr_scans,unique_scans,redirects,revisits\n';
-  for (const r of rows) {
-    csv += `${r.day},${r.qr_scans||0},${r.unique_scans||0},${r.redirects||0},${r.revisits||0}\n`;
-  }
+  for (const r of rows) csv += `${r.day},${r.qr_scans||0},${r.unique_scans||0},${r.redirects||0},${r.revisits||0}\n`;
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="kiosk-stats.csv"');
   res.send(csv);
 });
 
-// Convenience: root → kiosk
+// Root convenience
 app.get('/', (req, res) => res.redirect('/kiosk'));
 
 // ---------- BOOT ----------
 (async () => {
-  store = usingPG ? pgStore() : fileStore();
   if (store.init) await store.init();
-  app.listen(PORT, () => {
-    console.log(`Flashka kiosk running on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`Flashka kiosk running on port ${PORT}`));
 })();

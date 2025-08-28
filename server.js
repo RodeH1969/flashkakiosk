@@ -1,4 +1,4 @@
-// server.js — Flashka Kiosk (Express + QR + daily stats)
+// server.js — Flashka Kiosk (tokens count scans; no blocking; always play)
 // Works on Render with Postgres (self-signed cert handled) or local JSON fallback.
 
 require('dotenv').config();
@@ -82,7 +82,7 @@ function fileStore() {
 }
 
 function pgStore() {
-  // IMPORTANT: allow Render's self-signed PG cert
+  // Allow Render's self-signed PG cert
   const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false },
@@ -180,7 +180,7 @@ function pgStore() {
 const usingPG = !!DATABASE_URL;
 let store = usingPG ? pgStore() : fileStore();
 
-// ---------- VIEWS ----------
+// ---------- VIEWS (kiosk screen) ----------
 app.get('/kiosk', async (req, res) => {
   const token = await store.getCurrentToken();
   const playUrl = playUrlFor(req, token);
@@ -204,7 +204,7 @@ app.get('/kiosk', async (req, res) => {
  <div class="wrap">
    <img class="logo" src="/flashka_logo.png" alt="Flashka"/>
    <h1>Scan to play Flashka</h1>
-   <div class="sub">Each scan generates a fresh, single-use game link.</div>
+   <div class="sub">Each scan generates a fresh game link.</div>
    <div class="qr">
      <img id="qrImg" src="${qrDataUrl}" alt="QR" style="width:85%;max-width:260px;height:auto"/>
      <div id="tokenInfo" class="token">Token: <strong>${token}</strong></div>
@@ -239,32 +239,33 @@ app.get('/kiosk/api/current', async (req, res) => {
   res.json({ token, playUrl, qrDataUrl: await makeQrDataUrl(playUrl) });
 });
 
-// Player landing: count → consume → advance → redirect (single-use)
+// ---------- SCAN HANDLER (ALWAYS REDIRECT; COUNT UNIQUE; ADVANCE ON FIRST) ----------
 app.get('/kiosk/play/:token', async (req, res) => {
   const token = parseInt(req.params.token, 10);
   if (!Number.isInteger(token)) return res.status(400).send('Invalid token');
 
+  // Count every hit
   await store.bumpMetric('qr_scans');
 
-  const used = await store.isConsumed(token);
-  if (!used) {
-    await store.consumeToken(token);
-    await store.bumpMetric('unique_scans');
+  const firstVisit = !(await store.isConsumed(token));
+  if (firstVisit) {
+    // Count one person for this token
+    await store.consumeToken(token);          // mark seen (for counting only)
+    await store.bumpMetric('unique_scans');   // <-- this is your headcount
 
+    // Advance kiosk token so next person gets a fresh QR
     const current = await store.getCurrentToken();
     if (token === current) await store.setCurrentToken(current + 1);
-
-    await store.bumpMetric('redirects');
-    const target = GAME_URL_TEMPLATE.replace('{token}', String(token));
-    return res.redirect(302, target);
+  } else {
+    // Optional: track revisits
+    await store.bumpMetric('revisits');
   }
 
-  await store.bumpMetric('revisits');
-  const consumedAt = (store.getConsumedAt ? await store.getConsumedAt(token) : null) || 'earlier';
-  res.status(410).send(
-    `<h1>Link expired</h1><p>This game link was already used at <b>${consumedAt}</b>.</p>
-     <p>Please scan a fresh QR at the kiosk.</p>`
-  );
+  // Always redirect to the game (no expiry)
+  await store.bumpMetric('redirects');
+  const target = GAME_URL_TEMPLATE.replace('{token}', String(token));
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  return res.redirect(302, target);
 });
 
 // ---------- STATS ----------
@@ -301,7 +302,7 @@ app.get('/kiosk/stats', async (req, res) => {
   <table>
     <thead><tr>
       <th>Date (YYYY-MM-DD)</th>
-      <th style="text-align:right">QR scans</th>
+      <th style="text-align:right">Total hits</th>
       <th style="text-align:right">Unique scans</th>
       <th style="text-align:right">Redirects</th>
       <th style="text-align:right">Revisits</th>

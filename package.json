@@ -1,0 +1,15 @@
+{
+  "name": "flashka-kiosk",
+  "version": "1.1.0",
+  "description": "QR kiosk that auto-advances to unique Flashka game links with daily stats",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "qrcode": "^1.5.4"
+  }
+}

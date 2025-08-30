@@ -1,4 +1,4 @@
-// server.js — Flashka Kiosk (tokens count scans; no blocking; always play)
+// server.js — Flashka Kiosk (single-use tokens; counts scans; always play game)
 // Works on Render with Postgres (self-signed cert handled) or local JSON fallback.
 
 require('dotenv').config();
@@ -64,9 +64,22 @@ function fileStore() {
     async init() {},
     async getCurrentToken() { return state.currentToken; },
     async setCurrentToken(v) { state.currentToken = v; saveState(); },
+
     async isConsumed(token) { return !!state.consumed[String(token)]; },
-    async consumeToken(token) { state.consumed[String(token)] = new Date().toISOString(); saveState(); },
+
+    // Return true only the FIRST time this token is consumed (single-use)
+    async consumeToken(token) {
+      const key = String(token);
+      const was = !!state.consumed[key];
+      if (!was) {
+        state.consumed[key] = new Date().toISOString();
+        saveState();
+      }
+      return !was;
+    },
+
     async getConsumedAt(token) { return state.consumed[String(token)] || null; },
+
     async bumpMetric(kind) {
       const day = dayKeyBrisbane();
       if (!metrics.days[day]) metrics.days[day] = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
@@ -124,17 +137,29 @@ function pgStore() {
         [{ currentToken: v }]
       );
     },
+
     async isConsumed(token) {
       const r = await pool.query(`SELECT 1 FROM consumed_tokens WHERE token=$1`, [token]);
       return r.rowCount > 0;
     },
+
+    // Return true only on FIRST insert (single-use)
     async consumeToken(token) {
-      await pool.query(`INSERT INTO consumed_tokens(token) VALUES ($1) ON CONFLICT DO NOTHING`, [token]);
+      const r = await pool.query(
+        `INSERT INTO consumed_tokens(token) VALUES ($1)
+         ON CONFLICT DO NOTHING`,
+        [token]
+      );
+      return r.rowCount === 1;
     },
+
     async getConsumedAt(token) {
       const r = await pool.query(`SELECT consumed_at FROM consumed_tokens WHERE token=$1`, [token]);
-      return r.rowCount ? r.rows[0].consumed_at.toISOString() : null;
+      if (!r.rowCount) return null;
+      const v = r.rows[0].consumed_at;
+      return (v instanceof Date) ? v.toISOString() : String(v);
     },
+
     async bumpMetric(kind) {
       const day = dayKeyBrisbane();
       const cols = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
@@ -150,6 +175,7 @@ function pgStore() {
         [day, cols.qr_scans, cols.unique_scans, cols.redirects, cols.revisits]
       );
     },
+
     async getMetrics() {
       const r = await pool.query(`SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`);
       const out = { tz: BRIS_TZ, days: {} };
@@ -164,6 +190,7 @@ function pgStore() {
       }
       return out;
     },
+
     async getMetricsRows() {
       const r = await pool.query(`SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`);
       return r.rows.map(row => ({
@@ -239,7 +266,23 @@ app.get('/kiosk/api/current', async (req, res) => {
   res.json({ token, playUrl, qrDataUrl: await makeQrDataUrl(playUrl) });
 });
 
-// ---------- SCAN HANDLER (ALWAYS REDIRECT; COUNT UNIQUE; ADVANCE ON FIRST) ----------
+// ---------- SCAN HANDLER (SINGLE-USE REDIRECT) ----------
+const EXPIRED_HTML = `<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QR Link Already Used</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#111;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center}
+  .card{max-width:640px;padding:28px 22px;background:#1b1b1b;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);text-align:center}
+  h1{margin:0 0 10px;font-size:24px}
+  p{margin:6px 0 0;opacity:.9}
+</style>
+</head><body>
+  <div class="card">
+    <h1>This link has already been used</h1>
+    <p>Please scan the QR code at the counter again to start a fresh game.</p>
+  </div>
+</body></html>`;
+
 app.get('/kiosk/play/:token', async (req, res) => {
   const token = parseInt(req.params.token, 10);
   if (!Number.isInteger(token)) return res.status(400).send('Invalid token');
@@ -247,21 +290,21 @@ app.get('/kiosk/play/:token', async (req, res) => {
   // Count every hit
   await store.bumpMetric('qr_scans');
 
-  const firstVisit = !(await store.isConsumed(token));
-  if (firstVisit) {
-    // Count one person for this token
-    await store.consumeToken(token);          // mark seen (for counting only)
-    await store.bumpMetric('unique_scans');   // <-- this is your headcount
+  // Atomically mark as consumed; true only the first time
+  const firstVisit = await store.consumeToken(token);
 
-    // Advance kiosk token so next person gets a fresh QR
-    const current = await store.getCurrentToken();
-    if (token === current) await store.setCurrentToken(current + 1);
-  } else {
-    // Optional: track revisits
+  if (!firstVisit) {
     await store.bumpMetric('revisits');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    return res.status(410).send(EXPIRED_HTML);
   }
 
-  // Always redirect to the game (no expiry)
+  // First use: count unique, advance rolling token, redirect to game
+  await store.bumpMetric('unique_scans');
+
+  const current = await store.getCurrentToken();
+  if (token === current) await store.setCurrentToken(current + 1);
+
   await store.bumpMetric('redirects');
   const target = GAME_URL_TEMPLATE.replace('{token}', String(token));
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');

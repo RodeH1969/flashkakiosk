@@ -316,7 +316,7 @@ const EXPIRED_HTML = `<!doctype html>
 </head><body>
   <div class="card">
     <h1>This link has already been used</h1>
-    <p>Please scan the QR code at the counter again to start a fresh game.</p>
+    <p>When you buy your next coffee scan the QR code at the counter again to start a fresh game.</p>
   </div>
 </body></html>`;
 

@@ -1,4 +1,4 @@
-// server.js — Flashka Kiosk (single-use tokens; counts scans; always play game)
+// server.js — Flashka Kiosk (single-use QR links, counts scans, iPhone-friendly QR size)
 // Works on Render with Postgres (self-signed cert handled) or local JSON fallback.
 
 require('dotenv').config();
@@ -12,8 +12,9 @@ const app = express();
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3030;
-const ENV_BASE_URL = process.env.BASE_URL || null; // usually not needed on Render
-const GAME_URL_TEMPLATE = process.env.GAME_URL_TEMPLATE || 'https://flashka.onrender.com/?token={token}';
+const ENV_BASE_URL = process.env.BASE_URL || null; // optional, usually not needed on Render
+const GAME_URL_TEMPLATE =
+  process.env.GAME_URL_TEMPLATE || 'https://flashka.onrender.com/?token={token}';
 const ADMIN_KEY = process.env.ADMIN_KEY || null;
 const DATABASE_URL = process.env.DATABASE_URL || null;
 
@@ -25,7 +26,12 @@ app.use(express.json());
 // ---------- TIME / HELPERS ----------
 const BRIS_TZ = 'Australia/Brisbane';
 function dayKeyBrisbane(d = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: BRIS_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: BRIS_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
 }
 function buildBaseUrl(req) {
   return ENV_BASE_URL || `${req.protocol}://${req.get('host')}`;
@@ -47,11 +53,19 @@ function requireAdmin(req, res) {
 const DATA_DIR = path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const METRICS_FILE = path.join(DATA_DIR, 'metrics.json');
-function ensureDataDir() { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR); }
-function loadJson(file, fallback) {
-  try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf-8')) : fallback; } catch { return fallback; }
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 }
-function saveJson(file, obj) { fs.writeFileSync(file, JSON.stringify(obj, null, 2)); }
+function loadJson(file, fallback) {
+  try {
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf-8')) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function saveJson(file, obj) {
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+}
 
 function fileStore() {
   ensureDataDir();
@@ -62,11 +76,16 @@ function fileStore() {
 
   return {
     async init() {},
-    async getCurrentToken() { return state.currentToken; },
-    async setCurrentToken(v) { state.currentToken = v; saveState(); },
-
-    async isConsumed(token) { return !!state.consumed[String(token)]; },
-
+    async getCurrentToken() {
+      return state.currentToken;
+    },
+    async setCurrentToken(v) {
+      state.currentToken = v;
+      saveState();
+    },
+    async isConsumed(token) {
+      return !!state.consumed[String(token)];
+    },
     // Return true only the FIRST time this token is consumed (single-use)
     async consumeToken(token) {
       const key = String(token);
@@ -77,20 +96,23 @@ function fileStore() {
       }
       return !was;
     },
-
-    async getConsumedAt(token) { return state.consumed[String(token)] || null; },
-
+    async getConsumedAt(token) {
+      return state.consumed[String(token)] || null;
+    },
     async bumpMetric(kind) {
       const day = dayKeyBrisbane();
-      if (!metrics.days[day]) metrics.days[day] = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
+      if (!metrics.days[day])
+        metrics.days[day] = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
       metrics.days[day][kind] = (metrics.days[day][kind] || 0) + 1;
       saveMetrics();
     },
-    async getMetrics() { return metrics; },
+    async getMetrics() {
+      return metrics;
+    },
     async getMetricsRows() {
       const days = Object.keys(metrics.days).sort();
-      return days.map(d => ({ day: d, ...metrics.days[d] }));
-    }
+      return days.map((d) => ({ day: d, ...metrics.days[d] }));
+    },
   };
 }
 
@@ -99,7 +121,7 @@ function pgStore() {
   const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    max: 5
+    max: 5,
   });
 
   return {
@@ -123,43 +145,46 @@ function pgStore() {
       `);
       const r = await pool.query(`SELECT 1 FROM kiosk_state WHERE key='state'`);
       if (!r.rowCount) {
-        await pool.query(`INSERT INTO kiosk_state(key,value) VALUES ('state', $1)`, [{ currentToken: 1000 }]);
+        await pool.query(`INSERT INTO kiosk_state(key,value) VALUES ('state', $1)`, [
+          { currentToken: 1000 },
+        ]);
       }
     },
     async getCurrentToken() {
-      const r = await pool.query(`SELECT (value->>'currentToken')::int AS t FROM kiosk_state WHERE key='state'`);
+      const r = await pool.query(
+        `SELECT (value->>'currentToken')::int AS t FROM kiosk_state WHERE key='state'`,
+      );
       return r.rows[0]?.t ?? 1000;
     },
     async setCurrentToken(v) {
       await pool.query(
         `INSERT INTO kiosk_state(key,value) VALUES ('state',$1)
          ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`,
-        [{ currentToken: v }]
+        [{ currentToken: v }],
       );
     },
-
     async isConsumed(token) {
       const r = await pool.query(`SELECT 1 FROM consumed_tokens WHERE token=$1`, [token]);
       return r.rowCount > 0;
     },
-
     // Return true only on FIRST insert (single-use)
     async consumeToken(token) {
       const r = await pool.query(
         `INSERT INTO consumed_tokens(token) VALUES ($1)
          ON CONFLICT DO NOTHING`,
-        [token]
+        [token],
       );
       return r.rowCount === 1;
     },
-
     async getConsumedAt(token) {
-      const r = await pool.query(`SELECT consumed_at FROM consumed_tokens WHERE token=$1`, [token]);
+      const r = await pool.query(
+        `SELECT consumed_at FROM consumed_tokens WHERE token=$1`,
+        [token],
+      );
       if (!r.rowCount) return null;
       const v = r.rows[0].consumed_at;
-      return (v instanceof Date) ? v.toISOString() : String(v);
+      return v instanceof Date ? v.toISOString() : new Date(v).toISOString();
     },
-
     async bumpMetric(kind) {
       const day = dayKeyBrisbane();
       const cols = { qr_scans: 0, unique_scans: 0, redirects: 0, revisits: 0 };
@@ -172,35 +197,44 @@ function pgStore() {
            unique_scans = metrics_days.unique_scans + EXCLUDED.unique_scans,
            redirects = metrics_days.redirects + EXCLUDED.redirects,
            revisits = metrics_days.revisits + EXCLUDED.revisits`,
-        [day, cols.qr_scans, cols.unique_scans, cols.redirects, cols.revisits]
+        [day, cols.qr_scans, cols.unique_scans, cols.redirects, cols.revisits],
       );
     },
-
     async getMetrics() {
-      const r = await pool.query(`SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`);
+      const r = await pool.query(
+        `SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`,
+      );
       const out = { tz: BRIS_TZ, days: {} };
       for (const row of r.rows) {
-        const d = row.day.toISOString().slice(0,10);
+        const d = (row.day instanceof Date ? row.day : new Date(row.day))
+          .toISOString()
+          .slice(0, 10);
         out.days[d] = {
-          qr_scans: Number(row.qr_scans)||0,
-          unique_scans: Number(row.unique_scans)||0,
-          redirects: Number(row.redirects)||0,
-          revisits: Number(row.revisits)||0
+          qr_scans: Number(row.qr_scans) || 0,
+          unique_scans: Number(row.unique_scans) || 0,
+          redirects: Number(row.redirects) || 0,
+          revisits: Number(row.revisits) || 0,
         };
       }
       return out;
     },
-
     async getMetricsRows() {
-      const r = await pool.query(`SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`);
-      return r.rows.map(row => ({
-        day: row.day.toISOString().slice(0,10),
-        qr_scans: Number(row.qr_scans)||0,
-        unique_scans: Number(row.unique_scans)||0,
-        redirects: Number(row.redirects)||0,
-        revisits: Number(row.revisits)||0
-      }));
-    }
+      const r = await pool.query(
+        `SELECT day, qr_scans, unique_scans, redirects, revisits FROM metrics_days ORDER BY day`,
+      );
+      return r.rows.map((row) => {
+        const d = (row.day instanceof Date ? row.day : new Date(row.day))
+          .toISOString()
+          .slice(0, 10);
+        return {
+          day: d,
+          qr_scans: Number(row.qr_scans) || 0,
+          unique_scans: Number(row.unique_scans) || 0,
+          redirects: Number(row.redirects) || 0,
+          revisits: Number(row.revisits) || 0,
+        };
+      });
+    },
   };
 }
 
@@ -213,7 +247,7 @@ app.get('/kiosk', async (req, res) => {
   const playUrl = playUrlFor(req, token);
   const qrDataUrl = await makeQrDataUrl(playUrl);
 
-  // Smaller QR + tighter layout (iPhone 6 friendly)
+  // Smaller QR (2/3 of previous size) + bold rule under logo
   const html = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -221,7 +255,8 @@ app.get('/kiosk', async (req, res) => {
 <style>
  body{font-family:Arial,Helvetica,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#fafafa}
  .wrap{width:min(360px,96vw);text-align:center;padding:16px;background:#fff;border:1px solid #eee;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,0.06)}
- img.logo{max-width:320px;width:100%;height:auto;object-fit:contain;margin-bottom:10px}
+ img.logo{max-width:320px;width:100%;height:auto;object-fit:contain;margin-bottom:6px}
+ .rule{font-size:13px;margin:2px 0 10px}
  h1{font-size:20px;margin:6px 0 6px}
  .sub{font-size:12px;color:#555;margin-bottom:12px}
  .qr{border:1px solid #e5e5e5;padding:10px;border-radius:12px}
@@ -230,10 +265,12 @@ app.get('/kiosk', async (req, res) => {
 </head><body>
  <div class="wrap">
    <img class="logo" src="/flashka_logo.png" alt="Flashka"/>
+   <div class="rule"><strong>1 scan per order</strong></div>
    <h1>Scan to play Flashka</h1>
    <div class="sub">Each scan generates a fresh game link.</div>
    <div class="qr">
-     <img id="qrImg" src="${qrDataUrl}" alt="QR" style="width:85%;max-width:260px;height:auto"/>
+     <!-- QR was 85%/260px; now 57%/173px (≈2/3) -->
+     <img id="qrImg" src="${qrDataUrl}" alt="QR" style="width:57%;max-width:173px;height:auto"/>
      <div id="tokenInfo" class="token">Token: <strong>${token}</strong></div>
    </div>
  </div>
@@ -316,13 +353,17 @@ app.get('/kiosk/stats', async (req, res) => {
   if (requireAdmin(req, res)) return;
   const rows = await store.getMetricsRows();
   const body = rows.length
-    ? rows.map(r => `<tr>
+    ? rows
+        .map(
+          (r) => `<tr>
         <td>${r.day}</td>
-        <td style="text-align:right">${r.qr_scans||0}</td>
-        <td style="text-align:right">${r.unique_scans||0}</td>
-        <td style="text-align:right">${r.redirects||0}</td>
-        <td style="text-align:right">${r.revisits||0}</td>
-      </tr>`).join('')
+        <td style="text-align:right">${r.qr_scans || 0}</td>
+        <td style="text-align:right">${r.unique_scans || 0}</td>
+        <td style="text-align:right">${r.redirects || 0}</td>
+        <td style="text-align:right">${r.revisits || 0}</td>
+      </tr>`,
+        )
+        .join('')
     : '<tr><td colspan="5" style="text-align:center;color:#777">No data yet</td></tr>';
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -364,7 +405,10 @@ app.get('/kiosk/stats.csv', async (req, res) => {
   if (requireAdmin(req, res)) return;
   const rows = await store.getMetricsRows();
   let csv = 'date,qr_scans,unique_scans,redirects,revisits\n';
-  for (const r of rows) csv += `${r.day},${r.qr_scans||0},${r.unique_scans||0},${r.redirects||0},${r.revisits||0}\n`;
+  for (const r of rows)
+    csv += `${r.day},${r.qr_scans || 0},${r.unique_scans || 0},${r.redirects || 0},${
+      r.revisits || 0
+    }\n`;
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="kiosk-stats.csv"');
   res.send(csv);
